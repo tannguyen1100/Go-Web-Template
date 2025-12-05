@@ -1,2 +1,1 @@
-# Go-Web-Template
-A template for building a Go web 
+# Golang Replicate Database Structure
