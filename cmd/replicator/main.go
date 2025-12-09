@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,8 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -33,8 +33,8 @@ type ReplicationStatus struct {
 }
 
 type Replicator struct {
-	primaryDB   *sql.DB
-	secondaryDB *sql.DB
+	primaryDB   *pgxpool.Pool
+	secondaryDB *pgxpool.Pool
 	config      Config
 	status      ReplicationStatus
 	statusMu    sync.RWMutex
@@ -43,10 +43,29 @@ type Replicator struct {
 }
 
 func main() {
+	err := godotenv.Load("D:\\Code\\Go-Web-Template\\.env")
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
+	}
+
+	main_database_host := os.Getenv("DATABASE_URL_HOST")
+	main_database_port := 6543
+	main_database_user := os.Getenv("DATABASE_URL_USER")
+	main_database_password := os.Getenv("DATABASE_URL_PASSWORD")
+	main_database_dbname := os.Getenv("DATABASE_URL_DBNAME")
+
+	replicator_database_host := os.Getenv("DATABASE_URL_REPLICATOR_HOST")
+	replicator_database_port := 6543
+	replicator_database_user := os.Getenv("DATABASE_URL_REPLICATOR_USER")
+	replicator_database_password := os.Getenv("DATABASE_URL_REPLICATOR_PASSWORD")
+	replicator_database_dbname := os.Getenv("DATABASE_URL_REPLICATOR_DBNAME")
+
 	config := Config{
-		PrimaryConnStr:   "sqlserver://newt:sqlserver@localhost:135?database=DemoDB&connection+timeout=30",
-		SecondaryConnStr: "sqlserver://newt:sqlserver@localhost:135?database=ReplicaDB&connection+timeout=30",
-		PollInterval:     5 * time.Second,
+		PrimaryConnStr: fmt.Sprintf("host=%s port=%d user=%s "+
+			"password=%s dbname=%s sslmode=require default_query_exec_mode=simple_protocol", main_database_host, main_database_port, main_database_user, main_database_password, main_database_dbname),
+		SecondaryConnStr: fmt.Sprintf("host=%s port=%d user=%s "+
+			"password=%s dbname=%s sslmode=require default_query_exec_mode=simple_protocol", replicator_database_host, replicator_database_port, replicator_database_user, replicator_database_password, replicator_database_dbname),
+		PollInterval: 5 * time.Second,
 	}
 
 	replicator, err := NewReplicator(config)
@@ -90,13 +109,13 @@ func main() {
 func NewReplicator(config Config) (*Replicator, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	primaryDB, err := sql.Open("sqlserver", config.PrimaryConnStr)
+	primaryDB, err := pgxpool.New(context.Background(), config.PrimaryConnStr)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to connect to primary: %w", err)
 	}
 
-	secondaryDB, err := sql.Open("sqlserver", config.SecondaryConnStr)
+	secondaryDB, err := pgxpool.New(context.Background(), config.SecondaryConnStr)
 	if err != nil {
 		primaryDB.Close()
 		cancel()
@@ -104,14 +123,14 @@ func NewReplicator(config Config) (*Replicator, error) {
 	}
 
 	// Test connections
-	if err := primaryDB.Ping(); err != nil {
+	if err := primaryDB.Ping(context.Background()); err != nil {
 		primaryDB.Close()
 		secondaryDB.Close()
 		cancel()
 		return nil, fmt.Errorf("primary DB ping failed: %w", err)
 	}
 
-	if err := secondaryDB.Ping(); err != nil {
+	if err := secondaryDB.Ping(context.Background()); err != nil {
 		primaryDB.Close()
 		secondaryDB.Close()
 		cancel()
@@ -175,60 +194,76 @@ func (r *Replicator) Close() {
 }
 
 func (r *Replicator) pollAndReplicate() error {
-	// Query CDC changes for Users table
-	// CDC function: cdc.fn_cdc_get_all_changes_<capture_instance>
-	// Default capture instance is dbo_Users
+	// Query unprocessed changes from user_changes table
 	query := `
-		DECLARE @from_lsn binary(10), @to_lsn binary(10);
-		SET @from_lsn = sys.fn_cdc_get_min_lsn('dbo_Users');
-		SET @to_lsn = sys.fn_cdc_get_max_lsn();
-		
 		SELECT 
-			__$operation as Operation,
-			__$start_lsn as LSN,
-			UserId,
-			Name,
-			Email,
-			CreatedAt,
-			UpdatedAt
-		FROM cdc.fn_cdc_get_all_changes_dbo_Users(@from_lsn, @to_lsn, 'all')
-		ORDER BY __$start_lsn;
+			change_id,
+			operation,
+			user_id,
+			name,
+			email,
+			created_at,
+			updated_at
+		FROM user_changes
+		WHERE processed = false
+		ORDER BY change_id
+		LIMIT 100
 	`
 
-	rows, err := r.primaryDB.Query(query)
+	rows, err := r.primaryDB.Query(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("CDC query failed: %w", err)
+		return fmt.Errorf("change query failed: %w", err)
 	}
 	defer rows.Close()
 
 	changeCount := 0
-	var lastLSN []byte
+	var lastChangeID int64
+	processedIDs := []int64{}
 
 	for rows.Next() {
-		var operation int
-		var lsn []byte
-		var userId sql.NullInt32
-		var name, email sql.NullString
-		var createdAt, updatedAt sql.NullTime
+		var changeID int64
+		var operation string
+		var userId *int32
+		var name, email *string
+		var createdAt, updatedAt *time.Time
 
-		if err := rows.Scan(&operation, &lsn, &userId, &name, &email, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&changeID, &operation, &userId, &name, &email, &createdAt, &updatedAt); err != nil {
 			return fmt.Errorf("scan error: %w", err)
 		}
 
-		lastLSN = lsn
+		lastChangeID = changeID
 
-		// Operation codes: 1=delete, 2=insert, 3=before update, 4=after update
+		// Apply the change to secondary database
 		switch operation {
-		case 2, 4: // Insert or Update
-			if err := r.upsertRecord(userId.Int32, name.String, email.String, createdAt.Time, updatedAt.Time); err != nil {
-				return fmt.Errorf("upsert failed: %w", err)
+		case "INSERT", "UPDATE":
+			if userId != nil && name != nil {
+				if err := r.upsertRecord(*userId, *name, email, createdAt, updatedAt); err != nil {
+					return fmt.Errorf("upsert failed: %w", err)
+				}
+				processedIDs = append(processedIDs, changeID)
+				changeCount++
 			}
-			changeCount++
-		case 1: // Delete
-			if err := r.deleteRecord(userId.Int32); err != nil {
-				return fmt.Errorf("delete failed: %w", err)
+		case "DELETE":
+			if userId != nil {
+				if err := r.deleteRecord(*userId); err != nil {
+					return fmt.Errorf("delete failed: %w", err)
+				}
+				processedIDs = append(processedIDs, changeID)
+				changeCount++
 			}
-			changeCount++
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Mark changes as processed
+	if len(processedIDs) > 0 {
+		updateQuery := `UPDATE user_changes SET processed = true WHERE change_id = ANY($1)`
+		_, err := r.primaryDB.Exec(context.Background(), updateQuery, processedIDs)
+		if err != nil {
+			return fmt.Errorf("failed to mark changes as processed: %w", err)
 		}
 	}
 
@@ -236,35 +271,31 @@ func (r *Replicator) pollAndReplicate() error {
 		r.statusMu.Lock()
 		r.status.RecordsReplied += int64(changeCount)
 		r.status.LastSyncTime = time.Now()
-		if lastLSN != nil {
-			r.status.LastLSN = fmt.Sprintf("%x", lastLSN)
-		}
+		r.status.LastLSN = fmt.Sprintf("%d", lastChangeID)
 		r.status.LastError = ""
 		r.statusMu.Unlock()
-		log.Printf("Replicated %d changes", changeCount)
+		log.Printf("Replicated %d changes (up to change_id %d)", changeCount, lastChangeID)
 	}
 
-	return rows.Err()
+	return nil
 }
 
-func (r *Replicator) upsertRecord(userId int32, name, email string, createdAt, updatedAt time.Time) error {
+func (r *Replicator) upsertRecord(userId int32, name string, email *string, createdAt, updatedAt *time.Time) error {
 	query := `
-		MERGE INTO Users AS target
-		USING (SELECT @UserId AS UserId, @Name AS Name, @Email AS Email, @CreatedAt AS CreatedAt, @UpdatedAt AS UpdatedAt) AS source
-		ON target.UserId = source.UserId
-		WHEN MATCHED THEN
-			UPDATE SET Name = source.Name, Email = source.Email, UpdatedAt = source.UpdatedAt
-		WHEN NOT MATCHED THEN
-			INSERT (UserId, Name, Email, CreatedAt, UpdatedAt)
-			VALUES (source.UserId, source.Name, source.Email, source.CreatedAt, source.UpdatedAt);
+		INSERT INTO users (user_id, name, email, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (user_id) 
+		DO UPDATE SET 
+			name = EXCLUDED.name,
+			email = EXCLUDED.email,
+			updated_at = EXCLUDED.updated_at
 	`
-	_, err := r.secondaryDB.Exec(query, sql.Named("UserId", userId), sql.Named("Name", name),
-		sql.Named("Email", email), sql.Named("CreatedAt", createdAt), sql.Named("UpdatedAt", updatedAt))
+	_, err := r.secondaryDB.Exec(context.Background(), query, userId, name, email, createdAt, updatedAt)
 	return err
 }
 
 func (r *Replicator) deleteRecord(userId int32) error {
-	_, err := r.secondaryDB.Exec("DELETE FROM Users WHERE UserId = @UserId", sql.Named("UserId", userId))
+	_, err := r.secondaryDB.Exec(context.Background(), "DELETE FROM users WHERE user_id = $1", userId)
 	return err
 }
 
